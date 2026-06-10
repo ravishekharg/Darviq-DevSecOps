@@ -1,0 +1,12 @@
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sBlockPrivileged
+metadata:
+  name: block-privileged
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds:    ["Deployment", "DaemonSet", "StatefulSet"]
+    excludedNamespaces:
+      - kube-system
+  enforcementAction: deny

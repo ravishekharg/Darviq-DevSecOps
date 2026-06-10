@@ -1,0 +1,322 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+  packages: write
+
+env:
+  IMAGE_NAME: devsecops-app
+  REGISTRY: ghcr.io
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Stage 1: SAST — Static Application Security Testing
+  # ────────────────────────────────────────────────────────────
+  sast:
+    name: SAST — Bandit + Semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit (Python SAST)
+        run: |
+          bandit -r app/ \
+            -f json \
+            -o bandit-report.json \
+            --severity-level medium \
+            --confidence-level medium || true
+          bandit -r app/ --severity-level medium --confidence-level medium
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/owasp-top-ten
+            p/secrets
+        continue-on-error: true
+
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 2: SCA — Dependency Vulnerability Scan
+  # ────────────────────────────────────────────────────────────
+  sca:
+    name: SCA — Dependency Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Safety
+        run: pip install safety
+
+      - name: Run Safety Check
+        run: |
+          pip install -r app/requirements.txt
+          safety check \
+            --full-report \
+            --json \
+            --output safety-report.json || true
+
+      - name: Upload Safety Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: safety-report
+          path: safety-report.json
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 3: IaC Scan — Checkov
+  # ────────────────────────────────────────────────────────────
+  iac-scan:
+    name: IaC Scan — Checkov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov on Terraform
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-terraform.sarif
+          soft_fail: true
+
+      - name: Run Checkov on Kubernetes manifests
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: kubernetes/
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-k8s.sarif
+          soft_fail: true
+
+      - name: Upload Checkov SARIF (Terraform)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-terraform.sarif
+          category: checkov-terraform
+
+      - name: Upload Checkov SARIF (Kubernetes)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-k8s.sarif
+          category: checkov-kubernetes
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 4: Build + Container Image Scan — Trivy
+  # ────────────────────────────────────────────────────────────
+  container-scan:
+    name: Build + Trivy Container Scan
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build image (no push yet)
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: app/
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy — CRITICAL vulnerabilities (block)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          vuln-type: os,library
+
+      - name: Run Trivy — Full scan (SARIF report)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+        if: always()
+
+      - name: Run Trivy — Filesystem scan (secrets + misconfig)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          scanners: misconfig,secret
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+        if: always()
+
+      - name: Push image (only if all scans pass)
+        uses: docker/build-push-action@v5
+        with:
+          context: app/
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 5: SBOM Generation — Syft
+  # ────────────────────────────────────────────────────────────
+  sbom:
+    name: SBOM Generation — Syft
+    runs-on: ubuntu-latest
+    needs: [container-scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM (SPDX format)
+        run: |
+          syft app/ \
+            --output spdx-json=sbom-spdx.json \
+            --output cyclonedx-json=sbom-cyclonedx.json \
+            --output table
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-spdx.json
+            sbom-cyclonedx.json
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 6: OPA Policy Check
+  # ────────────────────────────────────────────────────────────
+  opa-check:
+    name: OPA Policy Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/
+
+      - name: Run OPA — deny privileged
+        run: |
+          opa eval \
+            --data opa/policies/deny-privileged.rego \
+            --input kubernetes/deployment.yaml \
+            --format pretty \
+            "data.kubernetes.deny"
+
+      - name: Run OPA — require labels
+        run: |
+          opa eval \
+            --data opa/policies/require-labels.rego \
+            --input kubernetes/deployment.yaml \
+            --format pretty \
+            "data.kubernetes.deny"
+
+      - name: Run OPA — resource limits
+        run: |
+          opa eval \
+            --data opa/policies/resource-limits.rego \
+            --input kubernetes/deployment.yaml \
+            --format pretty \
+            "data.kubernetes.deny"
+
+  # ────────────────────────────────────────────────────────────
+  # Stage 7: Security Summary Report
+  # ────────────────────────────────────────────────────────────
+  security-report:
+    name: Consolidated Security Report
+    runs-on: ubuntu-latest
+    needs: [sast, sca, iac-scan, container-scan, sbom, opa-check]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+
+      - name: Run Security Report Generator
+        run: |
+          pip install rich
+          python scripts/security_report.py
+
+      - name: Post summary to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('security-summary.md')) {
+              const summary = fs.readFileSync('security-summary.md', 'utf8');
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            }
