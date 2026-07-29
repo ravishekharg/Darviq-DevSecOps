@@ -7,16 +7,16 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import List
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
 class Finding:
-    tool:     str
+    tool: str
     severity: str
-    title:    str
+    title: str
     location: str
-    cve:      str = ""
+    cve: str = ""
 
 
 @dataclass
@@ -36,10 +36,10 @@ def parse_bandit(path: str) -> List[Finding]:
         data = json.load(f)
     for result in data.get("results", []):
         findings.append(Finding(
-            tool     = "Bandit (SAST)",
-            severity = result.get("issue_severity", "UNKNOWN"),
-            title    = result.get("issue_text", ""),
-            location = f"{result.get('filename', '')}:{result.get('line_number', '')}"
+            tool="Bandit (SAST)",
+            severity=result.get("issue_severity", "UNKNOWN"),
+            title=result.get("issue_text", ""),
+            location=f"{result.get('filename', '')}:{result.get('line_number', '')}"
         ))
     return findings
 
@@ -52,11 +52,11 @@ def parse_safety(path: str) -> List[Finding]:
         data = json.load(f)
     for vuln in data.get("vulnerabilities", []):
         findings.append(Finding(
-            tool     = "Safety (SCA)",
-            severity = vuln.get("severity", "UNKNOWN").upper(),
-            title    = vuln.get("advisory", ""),
-            location = f"{vuln.get('package_name', '')} {vuln.get('analyzed_version', '')}",
-            cve      = vuln.get("CVE", "")
+            tool="Safety (SCA)",
+            severity=vuln.get("severity", "UNKNOWN").upper(),
+            title=vuln.get("advisory", ""),
+            location=f"{vuln.get('package_name', '')} {vuln.get('analyzed_version', '')}",
+            cve=vuln.get("CVE", "")
         ))
     return findings
 
@@ -102,7 +102,7 @@ def generate_markdown(report: Report) -> str:
 
 
 if __name__ == "__main__":
-    report = Report(generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    report = Report(generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
     report.findings.extend(parse_bandit("bandit-report/bandit-report.json"))
     report.findings.extend(parse_safety("safety-report/safety-report.json"))

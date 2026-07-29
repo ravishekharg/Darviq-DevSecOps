@@ -15,7 +15,7 @@ def home():
         "service": "devsecops-demo",
         "status":  "healthy",
         "hostname": socket.gethostname(),
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "version": os.getenv("APP_VERSION", "1.0.0")
     })
 
